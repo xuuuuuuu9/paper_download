@@ -15,7 +15,12 @@ class CliAndMetadataTests(unittest.TestCase):
         self.assertEqual(parser.parse_args(["init-db"]).command, "init-db")
         self.assertEqual(parser.parse_args(["import-journals", "-i", "name.txt"]).command, "import-journals")
         self.assertEqual(parser.parse_args(["discover", "--limit-per-journal", "25"]).limit_per_journal, 25)
-        self.assertEqual(parser.parse_args(["download", "--limit", "3", "--no-interactive"]).command, "download")
+        download_args = parser.parse_args(["download", "--max-jobs", "3", "--workers", "2"])
+        self.assertEqual(download_args.command, "download")
+        self.assertEqual(download_args.max_jobs, 3)
+        self.assertEqual(download_args.workers, 2)
+        self.assertEqual(parser.parse_args(["recent-events", "--limit", "5"]).command, "recent-events")
+        self.assertEqual(parser.parse_args(["export-failed", "-o", "failed.csv"]).output, "failed.csv")
 
         with self.assertRaises(SystemExit):
             parser.parse_args([])
@@ -31,6 +36,15 @@ class CliAndMetadataTests(unittest.TestCase):
                 "PAPER_MAILTO=reader@example.com\n"
                 "PAPER_LIMIT_PER_JOURNAL=25\n"
                 "PAPER_DOWNLOAD_LIMIT=75\n"
+                "PAPER_DOWNLOAD_WORKERS=6\n"
+                "PAPER_PER_MIRROR_WORKERS=2\n"
+                "PAPER_DOWNLOAD_POLL_SECONDS=11\n"
+                "PAPER_STOP_WHEN_IDLE=false\n"
+                "PAPER_MAX_ATTEMPTS=8\n"
+                "PAPER_RETRY_BASE_MINUTES=15\n"
+                "PAPER_RETRY_MAX_HOURS=12\n"
+                "PAPER_INTERACTIVE_CAPTCHA=false\n"
+                "PAPER_LOG_DIR=my-logs\n"
                 "PAPER_NO_INTERACTIVE=true\n"
                 "PAPER_MIRRORS=sci-hub.st,sci-hub.ru\n",
                 encoding="utf-8",
@@ -47,6 +61,15 @@ class CliAndMetadataTests(unittest.TestCase):
             self.assertEqual(settings.mailto, "reader@example.com")
             self.assertEqual(settings.limit_per_journal, 25)
             self.assertEqual(settings.download_limit, 3)
+            self.assertEqual(settings.download_workers, 6)
+            self.assertEqual(settings.per_mirror_workers, 2)
+            self.assertEqual(settings.download_poll_seconds, 11.0)
+            self.assertFalse(settings.stop_when_idle)
+            self.assertEqual(settings.max_attempts, 8)
+            self.assertEqual(settings.retry_base_minutes, 15)
+            self.assertEqual(settings.retry_max_hours, 12)
+            self.assertFalse(settings.interactive_captcha)
+            self.assertEqual(settings.log_dir, "my-logs")
             self.assertTrue(settings.no_interactive)
             self.assertEqual(settings.mirrors, ["sci-hub.st", "sci-hub.ru"])
 

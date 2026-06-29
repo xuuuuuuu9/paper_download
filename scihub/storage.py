@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Iterable
 
@@ -27,6 +28,7 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     @contextmanager
@@ -76,7 +78,10 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
+                    last_error_type TEXT NOT NULL DEFAULT '',
                     next_retry_at TEXT,
+                    leased_at TEXT,
+                    lease_owner TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -103,6 +108,18 @@ class Database:
                 );
                 """
             )
+            self._ensure_columns(conn)
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(download_jobs)").fetchall()}
+        additions = {
+            "last_error_type": "ALTER TABLE download_jobs ADD COLUMN last_error_type TEXT NOT NULL DEFAULT ''",
+            "leased_at": "ALTER TABLE download_jobs ADD COLUMN leased_at TEXT",
+            "lease_owner": "ALTER TABLE download_jobs ADD COLUMN lease_owner TEXT NOT NULL DEFAULT ''",
+        }
+        for column, sql in additions.items():
+            if column not in existing:
+                conn.execute(sql)
 
     def import_journals(self, journals: Iterable[tuple[str, str]]) -> int:
         imported = 0
@@ -192,6 +209,49 @@ class Database:
                 )
             )
 
+    def lease_jobs(self, worker_id: str, limit: int) -> list[sqlite3.Row]:
+        now = _utc_now()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT download_jobs.*, articles.title, articles.journal_id
+                FROM download_jobs
+                JOIN articles ON articles.doi = download_jobs.doi
+                WHERE download_jobs.status = 'pending'
+                   OR (download_jobs.status = 'retry_wait'
+                       AND (download_jobs.next_retry_at IS NULL OR download_jobs.next_retry_at <= ?))
+                ORDER BY download_jobs.created_at, download_jobs.id
+                LIMIT ?
+                """,
+                (now, limit),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"""
+                    UPDATE download_jobs
+                    SET status = 'leased',
+                        leased_at = ?,
+                        lease_owner = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, worker_id, *ids),
+                )
+                rows = conn.execute(
+                    f"""
+                    SELECT download_jobs.*, articles.title, articles.journal_id
+                    FROM download_jobs
+                    JOIN articles ON articles.doi = download_jobs.doi
+                    WHERE download_jobs.id IN ({placeholders})
+                    ORDER BY download_jobs.id
+                    """,
+                    ids,
+                ).fetchall()
+            return list(rows)
+
     def get_jobs(
         self,
         limit: int,
@@ -221,6 +281,9 @@ class Database:
                 SET status = 'failed',
                     attempts = attempts + 1,
                     last_error = ?,
+                    last_error_type = 'unknown_error',
+                    leased_at = NULL,
+                    lease_owner = '',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE doi = ?
                 """,
@@ -228,17 +291,89 @@ class Database:
             )
             conn.execute("INSERT INTO events (doi, kind, message) VALUES (?, 'download_failed', ?)", (doi, error))
 
-    def reset_failed_jobs(self) -> int:
+    def mark_job_retry_wait(self, doi: str, error_type: str, error: str, next_retry_at: datetime) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE download_jobs
+                SET status = 'retry_wait',
+                    attempts = attempts + 1,
+                    last_error_type = ?,
+                    last_error = ?,
+                    next_retry_at = ?,
+                    leased_at = NULL,
+                    lease_owner = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE doi = ?
+                """,
+                (error_type, error, _format_dt(next_retry_at), doi),
+            )
+            conn.execute(
+                "INSERT INTO events (doi, kind, message) VALUES (?, 'download_retry_wait', ?)",
+                (doi, f"{error_type}: {error}"),
+            )
+
+    def mark_job_terminal_failed(self, doi: str, error_type: str, error: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE download_jobs
+                SET status = 'failed',
+                    attempts = attempts + 1,
+                    last_error_type = ?,
+                    last_error = ?,
+                    next_retry_at = NULL,
+                    leased_at = NULL,
+                    lease_owner = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE doi = ?
+                """,
+                (error_type, error, doi),
+            )
+            conn.execute(
+                "INSERT INTO events (doi, kind, message) VALUES (?, 'download_failed', ?)",
+                (doi, f"{error_type}: {error}"),
+            )
+
+    def recover_stale_leases(self, max_age_minutes: int) -> int:
+        cutoff = _format_dt(datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes))
         with self.connection() as conn:
             before = conn.total_changes
             conn.execute(
                 """
                 UPDATE download_jobs
                 SET status = 'pending',
-                    last_error = '',
+                    leased_at = NULL,
+                    lease_owner = '',
                     updated_at = CURRENT_TIMESTAMP
-                WHERE status = 'failed'
-                """
+                WHERE status = 'leased'
+                  AND (leased_at IS NULL OR leased_at <= ?)
+                """,
+                (cutoff,),
+            )
+            return conn.total_changes - before
+
+    def reset_failed_jobs(self, error_type: str | None = None) -> int:
+        with self.connection() as conn:
+            before = conn.total_changes
+            params: tuple[str, ...] = ()
+            where = "status = 'failed'"
+            if error_type:
+                where += " AND last_error_type = ?"
+                params = (error_type,)
+            conn.execute(
+                f"""
+                UPDATE download_jobs
+                SET status = 'pending',
+                    last_error = '',
+                    last_error_type = '',
+                    next_retry_at = NULL,
+                    leased_at = NULL,
+                    lease_owner = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE {where}
+                """,
+                params,
             )
             return conn.total_changes - before
 
@@ -263,6 +398,10 @@ class Database:
                 UPDATE download_jobs
                 SET status = 'downloaded',
                     last_error = '',
+                    last_error_type = '',
+                    next_retry_at = NULL,
+                    leased_at = NULL,
+                    lease_owner = '',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE doi = ?
                 """,
@@ -274,3 +413,55 @@ class Database:
         with self.connection() as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS count FROM download_jobs GROUP BY status").fetchall()
             return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def error_counts(self) -> dict[str, int]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT last_error_type, COUNT(*) AS count
+                FROM download_jobs
+                WHERE last_error_type != ''
+                GROUP BY last_error_type
+                ORDER BY last_error_type
+                """
+            ).fetchall()
+            return {str(row["last_error_type"]): int(row["count"]) for row in rows}
+
+    def failed_jobs(self) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT download_jobs.*, articles.title, journals.name AS journal
+                    FROM download_jobs
+                    JOIN articles ON articles.doi = download_jobs.doi
+                    JOIN journals ON journals.id = articles.journal_id
+                    WHERE download_jobs.status IN ('failed', 'retry_wait')
+                    ORDER BY download_jobs.updated_at DESC
+                    """
+                )
+            )
+
+    def downloaded_files(self) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT pdf_files.*, articles.title, journals.name AS journal
+                    FROM pdf_files
+                    JOIN articles ON articles.doi = pdf_files.doi
+                    JOIN journals ON journals.id = articles.journal_id
+                    ORDER BY pdf_files.updated_at DESC
+                    """
+                )
+            )
+
+
+def _utc_now() -> str:
+    return _format_dt(datetime.now(timezone.utc))
+
+
+def _format_dt(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")

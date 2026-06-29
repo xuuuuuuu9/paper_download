@@ -29,9 +29,18 @@ PAPER_COOKIE_DIR=.cookies
 
 PAPER_MAILTO=your@email.com
 PAPER_LIMIT_PER_JOURNAL=100
-PAPER_DOWNLOAD_LIMIT=50
 PAPER_FROM_YEAR=
 PAPER_TO_YEAR=
+
+PAPER_DOWNLOAD_WORKERS=4
+PAPER_PER_MIRROR_WORKERS=1
+PAPER_DOWNLOAD_POLL_SECONDS=30
+PAPER_STOP_WHEN_IDLE=true
+PAPER_MAX_ATTEMPTS=5
+PAPER_RETRY_BASE_MINUTES=30
+PAPER_RETRY_MAX_HOURS=24
+PAPER_INTERACTIVE_CAPTCHA=true
+PAPER_LOG_DIR=logs
 
 PAPER_MIN_DELAY=2.0
 PAPER_MAX_DELAY=5.0
@@ -87,10 +96,17 @@ PAPER_FROM_YEAR=2000
 PAPER_TO_YEAR=2026
 ```
 
-Download pending DOI jobs:
+Run the concurrent downloader. By default it processes ready jobs until the
+queue is idle:
 
 ```bash
 python download_papers.py download
+```
+
+For a test run, cap the total processed jobs:
+
+```bash
+python download_papers.py download --max-jobs 100
 ```
 
 Show queue status:
@@ -105,10 +121,24 @@ Move failed jobs back to pending:
 python download_papers.py retry-failed
 ```
 
-Run without opening a browser for manual captcha solving:
+Move only one failure type back to pending:
 
 ```bash
-python download_papers.py download --limit 50 --no-interactive
+python download_papers.py retry-failed --error-type network_error
+```
+
+Inspect recent events and export results:
+
+```bash
+python download_papers.py recent-events --limit 50
+python download_papers.py export-failed -o failed.csv
+python download_papers.py export-downloaded -o downloaded.csv
+```
+
+Disable browser captcha solving:
+
+```bash
+python download_papers.py download --no-interactive
 ```
 
 ## `name.txt` Format
@@ -132,7 +162,9 @@ The current `name.txt` uses the second form.
   the failure is recorded in SQLite events and the next source/journal continues.
 - OpenAlex and Crossref discoveries are deduplicated by DOI, while the original
   metadata sources are preserved in `article_sources`.
-- PDF writes remain atomic: files are written as `.part` first and renamed only
-  after the `%PDF` signature is verified.
-- For large runs, use small batches such as `download --limit 50` and inspect
-  `status` between batches.
+- The downloader is concurrent. Global concurrency defaults to 4 workers, and
+  per-mirror concurrency defaults to 1 worker.
+- Captcha/browser solving is serialized: only one Playwright window opens at a
+  time, and workers waiting on the same mirror reuse the saved cookie result.
+- PDF writes remain atomic: files are written as unique `.part.<job_id>` files
+  first and renamed only after the `%PDF` signature is verified.

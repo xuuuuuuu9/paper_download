@@ -14,7 +14,13 @@ _CHUNK = 64 * 1024
 _HEADER_PROBE = 2048  # bytes inspected for the %PDF signature
 
 
-def download_pdf(session: MirrorSession, pdf_url: str, referer: str, dest: Path) -> tuple[bool, str]:
+def download_pdf(
+    session: MirrorSession,
+    pdf_url: str,
+    referer: str,
+    dest: Path,
+    temp_suffix: str = "",
+) -> tuple[bool, str]:
     """Stream ``pdf_url`` to ``dest``. Returns ``(ok, detail)``."""
     try:
         resp = session.get(pdf_url, referer=referer, stream=True)
@@ -25,7 +31,7 @@ def download_pdf(session: MirrorSession, pdf_url: str, referer: str, dest: Path)
         if resp.status_code != 200:
             return False, f"HTTP {resp.status_code}"
 
-        tmp = dest.with_name(dest.name + ".part")
+        tmp = dest.with_name(dest.name + ".part" + temp_suffix)
         header = b""
         verified = False
         written = 0
@@ -58,11 +64,11 @@ def download_pdf(session: MirrorSession, pdf_url: str, referer: str, dest: Path)
             pass
 
 
-def save_bytes_as_pdf(content: bytes, dest: Path) -> tuple[bool, str]:
+def save_bytes_as_pdf(content: bytes, dest: Path, temp_suffix: str = "") -> tuple[bool, str]:
     """Persist an already-downloaded body (when the mirror serves the PDF directly)."""
     if not content.startswith(config.PDF_MAGIC):
         return False, "响应非 PDF"
-    tmp = dest.with_name(dest.name + ".part")
+    tmp = dest.with_name(dest.name + ".part" + temp_suffix)
     tmp.write_bytes(content)
     tmp.replace(dest)
     return True, f"{len(content) / 1024:.0f} KB"

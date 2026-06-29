@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scihub.naming import doi_to_readable_pdf_path
@@ -96,6 +97,63 @@ class StorageTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(row, ("downloaded", "papers/by_doi/10.1038/10.1038_example.pdf", 1234, "abc123", "sci-hub.st"))
             self.assertEqual(db.get_jobs(limit=10)[0]["status"], "downloaded")
+
+    def test_lease_jobs_claims_each_pending_job_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "papers.db")
+            db.init()
+            db.import_journals([("Nature", "")])
+            for doi in ("10.1038/one", "10.1038/two", "10.1038/three"):
+                db.upsert_article(ArticleRecord(doi=doi, journal_id=1, source="test"))
+
+            first = db.lease_jobs(worker_id="worker-a", limit=2)
+            second = db.lease_jobs(worker_id="worker-b", limit=2)
+
+            self.assertEqual([job["doi"] for job in first], ["10.1038/one", "10.1038/two"])
+            self.assertEqual([job["doi"] for job in second], ["10.1038/three"])
+            self.assertEqual(db.status_counts()["leased"], 3)
+
+    def test_retry_wait_jobs_are_not_leased_until_due(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "papers.db")
+            db.init()
+            db.import_journals([("Nature", "")])
+            db.upsert_article(ArticleRecord(doi="10.1038/example", journal_id=1, source="test"))
+
+            future = datetime.now(timezone.utc) + timedelta(hours=1)
+            db.mark_job_retry_wait("10.1038/example", "network_error", "temporary", future)
+            self.assertEqual(db.lease_jobs(worker_id="worker-a", limit=1), [])
+
+            past = datetime.now(timezone.utc) - timedelta(minutes=1)
+            db.mark_job_retry_wait("10.1038/example", "network_error", "retry now", past)
+            leased = db.lease_jobs(worker_id="worker-a", limit=1)
+
+            self.assertEqual(len(leased), 1)
+            self.assertEqual(leased[0]["doi"], "10.1038/example")
+
+    def test_recover_stale_leases_returns_old_leased_jobs_to_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "papers.db")
+            db.init()
+            db.import_journals([("Nature", "")])
+            db.upsert_article(ArticleRecord(doi="10.1038/example", journal_id=1, source="test"))
+
+            db.lease_jobs(worker_id="worker-a", limit=1)
+            recovered = db.recover_stale_leases(max_age_minutes=0)
+
+            self.assertEqual(recovered, 1)
+            self.assertEqual(db.get_jobs(limit=1)[0]["status"], "pending")
+
+    def test_status_counts_by_error_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "papers.db")
+            db.init()
+            db.import_journals([("Nature", "")])
+            db.upsert_article(ArticleRecord(doi="10.1038/example", journal_id=1, source="test"))
+
+            db.mark_job_terminal_failed("10.1038/example", "captcha_required", "captcha needed")
+
+            self.assertEqual(db.error_counts(), {"captcha_required": 1})
 
     def test_doi_readable_path_groups_by_prefix(self):
         path = doi_to_readable_pdf_path(Path("papers"), "10.1002/(sici)(1997)5:1<1::aid-nt1>3.0.co;2-8")

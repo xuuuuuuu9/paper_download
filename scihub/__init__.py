@@ -7,6 +7,7 @@ browser fallback when a challenge cannot be avoided.
 
 __all__ = [
     "browser",
+    "captcha",
     "cli",
     "config",
     "cookies",
@@ -16,5 +17,6 @@ __all__ = [
     "naming",
     "parse",
     "runner",
+    "scheduler",
     "storage",
 ]

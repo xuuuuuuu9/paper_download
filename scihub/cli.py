@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import logging
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from . import config
 from .cookies import CookieStore
 from .metadata import CrossrefClient, OpenAlexClient
 from .runner import Downloader
+from .scheduler import DownloadScheduler, SchedulerConfig
 from .storage import ArticleRecord, Database
 
 
@@ -28,6 +32,16 @@ class Settings:
     mailto: str = ""
     limit_per_journal: int = 100
     download_limit: int = 50
+    max_jobs: int | None = None
+    download_workers: int = 4
+    per_mirror_workers: int = 1
+    download_poll_seconds: float = 30.0
+    stop_when_idle: bool = True
+    max_attempts: int = 5
+    retry_base_minutes: int = 30
+    retry_max_hours: int = 24
+    interactive_captcha: bool = True
+    log_dir: str = "logs"
     from_year: int | None = None
     to_year: int | None = None
     min_delay: float = config.MIN_DELAY
@@ -78,7 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--to-year", type=int, default=None, help="Newest publication year to discover")
 
     download = sub.add_parser("download", help="Download queued DOI records from Sci-Hub")
-    download.add_argument("--limit", type=int, default=None, help="Maximum jobs to process")
+    download.add_argument("--limit", type=int, default=None, help=argparse.SUPPRESS)
+    download.add_argument("--max-jobs", type=int, default=None, help="Debug/test cap for total jobs processed")
+    download.add_argument("--workers", type=int, default=None, help="Global concurrent download workers")
+    download.add_argument("--per-mirror-workers", type=int, default=None, help="Concurrent workers per mirror")
     download.add_argument("-o", "--output", default=None, help="PDF root directory")
     download.add_argument("--cookie-dir", default=None)
     download.add_argument("--mirrors", nargs="+", default=None)
@@ -86,8 +103,16 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--min-delay", type=float, default=None)
     download.add_argument("--max-delay", type=float, default=None)
 
-    sub.add_parser("retry-failed", help="Move failed jobs back to pending")
+    retry = sub.add_parser("retry-failed", help="Move failed jobs back to pending")
+    retry.add_argument("--error-type", default=None)
+    retry.add_argument("--all", action="store_true")
     sub.add_parser("status", help="Show queue status counts")
+    events = sub.add_parser("recent-events", help="Show recent event records")
+    events.add_argument("--limit", type=int, default=50)
+    failed = sub.add_parser("export-failed", help="Export failed/retry-wait jobs as CSV")
+    failed.add_argument("-o", "--output", required=True)
+    downloaded = sub.add_parser("export-downloaded", help="Export downloaded PDFs as CSV")
+    downloaded.add_argument("-o", "--output", required=True)
     return parser
 
 
@@ -104,6 +129,18 @@ def load_settings(args: argparse.Namespace) -> Settings:
         limit_per_journal=getattr(args, "limit_per_journal", None)
         or _env_int(env, "PAPER_LIMIT_PER_JOURNAL", defaults.limit_per_journal),
         download_limit=getattr(args, "limit", None) or _env_int(env, "PAPER_DOWNLOAD_LIMIT", defaults.download_limit),
+        max_jobs=getattr(args, "max_jobs", None),
+        download_workers=getattr(args, "workers", None)
+        or _env_int(env, "PAPER_DOWNLOAD_WORKERS", defaults.download_workers),
+        per_mirror_workers=getattr(args, "per_mirror_workers", None)
+        or _env_int(env, "PAPER_PER_MIRROR_WORKERS", defaults.per_mirror_workers),
+        download_poll_seconds=_env_float(env, "PAPER_DOWNLOAD_POLL_SECONDS", defaults.download_poll_seconds),
+        stop_when_idle=_env_bool(env, "PAPER_STOP_WHEN_IDLE", defaults.stop_when_idle),
+        max_attempts=_env_int(env, "PAPER_MAX_ATTEMPTS", defaults.max_attempts),
+        retry_base_minutes=_env_int(env, "PAPER_RETRY_BASE_MINUTES", defaults.retry_base_minutes),
+        retry_max_hours=_env_int(env, "PAPER_RETRY_MAX_HOURS", defaults.retry_max_hours),
+        interactive_captcha=_env_bool(env, "PAPER_INTERACTIVE_CAPTCHA", defaults.interactive_captcha),
+        log_dir=_env_str(env, "PAPER_LOG_DIR", defaults.log_dir),
         from_year=getattr(args, "from_year", None) or _env_optional_int(env, "PAPER_FROM_YEAR"),
         to_year=getattr(args, "to_year", None) or _env_optional_int(env, "PAPER_TO_YEAR"),
         min_delay=getattr(args, "min_delay", None) or _env_float(env, "PAPER_MIN_DELAY", defaults.min_delay),
@@ -220,35 +257,33 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "download":
         db.init()
-        downloader = Downloader(
-            output_dir=Path(settings.output_dir),
-            cookie_store=CookieStore(settings.cookie_dir),
-            mirrors=tuple(settings.mirrors or list(config.MIRRORS)),
-            interactive=not settings.no_interactive,
-            delay=(settings.min_delay, settings.max_delay),
+        logger = _setup_download_logger(Path(settings.log_dir))
+        scheduler = DownloadScheduler(
+            db=db,
+            cfg=SchedulerConfig(
+                output_dir=Path(settings.output_dir),
+                cookie_dir=settings.cookie_dir,
+                mirrors=tuple(settings.mirrors or list(config.MIRRORS)),
+                workers=settings.download_workers,
+                per_mirror_workers=settings.per_mirror_workers,
+                poll_seconds=settings.download_poll_seconds,
+                stop_when_idle=settings.stop_when_idle,
+                max_attempts=settings.max_attempts,
+                retry_base_minutes=settings.retry_base_minutes,
+                retry_max_hours=settings.retry_max_hours,
+                interactive_captcha=settings.interactive_captcha and not settings.no_interactive,
+                delay=(settings.min_delay, settings.max_delay),
+                max_jobs=settings.max_jobs if settings.max_jobs is not None else getattr(args, "limit", None),
+            ),
+            logger=logger,
         )
-        jobs = db.get_jobs(limit=settings.download_limit, statuses=("pending",))
-        if not jobs:
-            print("No pending jobs.")
-            return 0
-        for job in jobs:
-            doi = str(job["doi"])
-            outcome = downloader.download_one(doi)
-            if outcome.status in ("ok", "skipped") and outcome.path and outcome.path.exists():
-                db.mark_downloaded(
-                    doi=doi,
-                    path=outcome.path,
-                    size_bytes=outcome.path.stat().st_size,
-                    sha256=_sha256(outcome.path),
-                    mirror=outcome.mirror,
-                )
-            else:
-                db.mark_job_failed(doi, outcome.error or "download failed")
+        processed = scheduler.run()
+        print(f"Processed jobs: {processed}")
         return 0
 
     if args.command == "retry-failed":
         db.init()
-        count = db.reset_failed_jobs()
+        count = db.reset_failed_jobs(error_type=args.error_type)
         print(f"Retried jobs queued: {count}")
         return 0
 
@@ -260,6 +295,35 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for status, count in sorted(counts.items()):
             print(f"{status}: {count}")
+        errors = db.error_counts()
+        for error_type, count in sorted(errors.items()):
+            print(f"error.{error_type}: {count}")
+        return 0
+
+    if args.command == "recent-events":
+        db.init()
+        for row in db.list_events(limit=args.limit):
+            print(f"{row['created_at']}\t{row['kind']}\t{row['doi'] or row['journal_id'] or ''}\t{row['message']}")
+        return 0
+
+    if args.command == "export-failed":
+        db.init()
+        _write_csv(
+            Path(args.output),
+            ["doi", "title", "journal", "status", "last_error_type", "last_error", "attempts", "next_retry_at"],
+            db.failed_jobs(),
+        )
+        print(f"Exported failed jobs: {args.output}")
+        return 0
+
+    if args.command == "export-downloaded":
+        db.init()
+        _write_csv(
+            Path(args.output),
+            ["doi", "title", "journal", "file_path", "size_bytes", "sha256", "mirror", "created_at"],
+            db.downloaded_files(),
+        )
+        print(f"Exported downloaded files: {args.output}")
         return 0
 
     return 2
@@ -271,6 +335,32 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _setup_download_logger(log_dir: Path) -> logging.Logger:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"download-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    logger = logging.getLogger("scihub.download")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = logging.FileHandler(path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    logger.info("download log: %s", path)
+    return logger
+
+
+def _write_csv(path: Path, fieldnames: list[str], rows) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True) if path.parent != Path(".") else None
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row[field] if field in row.keys() else "" for field in fieldnames})
 
 
 if __name__ == "__main__":
