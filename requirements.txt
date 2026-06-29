@@ -1,0 +1,8 @@
+# TLS-impersonating HTTP client. It matches Chrome's JA3 fingerprint so
+# DDoS-Guard is less likely to return a challenge page.
+curl_cffi>=0.7.0
+
+# Manual-verification fallback: opens Chromium so a captcha/challenge can be
+# solved once, then stores cookies for later runs.
+# After install run: playwright install chromium
+playwright>=1.40.0
