@@ -39,12 +39,23 @@ class OpenAlexClient:
         self.mailto = mailto
         self.per_page = per_page
 
-    def iter_articles(self, journal_name: str, limit: int | None = None) -> Iterator[DiscoveredArticle]:
+    def iter_articles(
+        self,
+        journal_name: str,
+        limit: int | None = None,
+        from_year: int | None = None,
+        to_year: int | None = None,
+    ) -> Iterator[DiscoveredArticle]:
         yielded = 0
         cursor = "*"
         while True:
+            filters = [f"primary_location.source.display_name.search:{journal_name}"]
+            if from_year:
+                filters.append(f"from_publication_date:{from_year}-01-01")
+            if to_year:
+                filters.append(f"to_publication_date:{to_year}-12-31")
             params = {
-                "filter": f"primary_location.source.display_name.search:{journal_name}",
+                "filter": ",".join(filters),
                 "per-page": str(min(self.per_page, limit or self.per_page)),
                 "cursor": cursor,
             }
@@ -83,17 +94,28 @@ class CrossrefClient:
         self.mailto = mailto
         self.rows = rows
 
-    def iter_articles(self, journal_name: str, limit: int | None = None) -> Iterator[DiscoveredArticle]:
+    def iter_articles(
+        self,
+        journal_name: str,
+        limit: int | None = None,
+        from_year: int | None = None,
+        to_year: int | None = None,
+    ) -> Iterator[DiscoveredArticle]:
         yielded = 0
-        offset = 0
+        cursor = "*"
         seen: set[str] = set()
         while True:
             rows = min(self.rows, limit or self.rows)
+            filters = ["type:journal-article", "has-full-text:true"]
+            if from_year:
+                filters.append(f"from-pub-date:{from_year}-01-01")
+            if to_year:
+                filters.append(f"until-pub-date:{to_year}-12-31")
             params = {
                 "query.container-title": journal_name,
-                "filter": "type:journal-article,has-full-text:true",
+                "filter": ",".join(filters),
                 "rows": str(rows),
-                "offset": str(offset),
+                "cursor": cursor,
             }
             if self.mailto:
                 params["mailto"] = self.mailto
@@ -119,7 +141,10 @@ class CrossrefClient:
                     return
             if len(items) < rows:
                 return
-            offset += len(items)
+            next_cursor = (response.json().get("message") or {}).get("next-cursor")
+            if not next_cursor or next_cursor == cursor:
+                return
+            cursor = next_cursor
 
     @staticmethod
     def _clean_doi(raw: str | None) -> str:

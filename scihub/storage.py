@@ -63,6 +63,13 @@ class Database:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS article_sources (
+                    doi TEXT NOT NULL REFERENCES articles(doi),
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (doi, source)
+                );
+
                 CREATE TABLE IF NOT EXISTS download_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     doi TEXT NOT NULL UNIQUE REFERENCES articles(doi),
@@ -143,8 +150,47 @@ class Database:
                 (doi, article.journal_id, article.title, article.year, article.source),
             )
             conn.execute("INSERT OR IGNORE INTO download_jobs (doi, status) VALUES (?, 'pending')", (doi,))
+            if article.source:
+                conn.execute(
+                    "INSERT OR IGNORE INTO article_sources (doi, source) VALUES (?, ?)",
+                    (doi, article.source),
+                )
             row = conn.execute("SELECT id FROM articles WHERE doi = ?", (doi,)).fetchone()
             return int(row["id"])
+
+    def list_article_sources(self, doi: str) -> list[str]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT source FROM article_sources WHERE doi = ? ORDER BY source",
+                (doi.strip().lower(),),
+            ).fetchall()
+            return [str(row["source"]) for row in rows]
+
+    def mark_journal_status(self, journal_id: int, status: str, message: str = "") -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE journals
+                SET status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, journal_id),
+            )
+            kind = "journal_error" if status == "error" else "journal_status"
+            conn.execute(
+                "INSERT INTO events (journal_id, kind, message) VALUES (?, ?, ?)",
+                (journal_id, kind, message),
+            )
+
+    def list_events(self, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM events ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                )
+            )
 
     def get_jobs(
         self,

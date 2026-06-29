@@ -28,6 +28,8 @@ class Settings:
     mailto: str = ""
     limit_per_journal: int = 100
     download_limit: int = 50
+    from_year: int | None = None
+    to_year: int | None = None
     min_delay: float = config.MIN_DELAY
     max_delay: float = config.MAX_DELAY
     no_interactive: bool = False
@@ -72,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     discover = sub.add_parser("discover", help="Discover DOI records for imported journals")
     discover.add_argument("--limit-per-journal", type=int, default=None, help="Maximum DOI records per journal")
     discover.add_argument("--mailto", default=None, help="Email passed to OpenAlex polite pool")
+    discover.add_argument("--from-year", type=int, default=None, help="Oldest publication year to discover")
+    discover.add_argument("--to-year", type=int, default=None, help="Newest publication year to discover")
 
     download = sub.add_parser("download", help="Download queued DOI records from Sci-Hub")
     download.add_argument("--limit", type=int, default=None, help="Maximum jobs to process")
@@ -100,6 +104,8 @@ def load_settings(args: argparse.Namespace) -> Settings:
         limit_per_journal=getattr(args, "limit_per_journal", None)
         or _env_int(env, "PAPER_LIMIT_PER_JOURNAL", defaults.limit_per_journal),
         download_limit=getattr(args, "limit", None) or _env_int(env, "PAPER_DOWNLOAD_LIMIT", defaults.download_limit),
+        from_year=getattr(args, "from_year", None) or _env_optional_int(env, "PAPER_FROM_YEAR"),
+        to_year=getattr(args, "to_year", None) or _env_optional_int(env, "PAPER_TO_YEAR"),
         min_delay=getattr(args, "min_delay", None) or _env_float(env, "PAPER_MIN_DELAY", defaults.min_delay),
         max_delay=getattr(args, "max_delay", None) or _env_float(env, "PAPER_MAX_DELAY", defaults.max_delay),
         no_interactive=(
@@ -119,6 +125,11 @@ def _env_str(env: dict, key: str, default: str) -> str:
 def _env_int(env: dict, key: str, default: int) -> int:
     value = env.get(key)
     return int(value) if value is not None and str(value).strip() else default
+
+
+def _env_optional_int(env: dict, key: str) -> int | None:
+    value = env.get(key)
+    return int(value) if value is not None and str(value).strip() else None
 
 
 def _env_float(env: dict, key: str, default: float) -> float:
@@ -177,20 +188,32 @@ def main(argv: list[str] | None = None) -> int:
             count = 0
             for client in clients:
                 source_count = 0
-                for article in client.iter_articles(journal["name"], limit=settings.limit_per_journal):
-                    db.upsert_article(
-                        ArticleRecord(
-                            doi=article.doi,
-                            journal_id=int(journal["id"]),
-                            title=article.title,
-                            year=article.year,
-                            source=article.source,
+                try:
+                    for article in client.iter_articles(
+                        journal["name"],
+                        limit=settings.limit_per_journal,
+                        from_year=settings.from_year,
+                        to_year=settings.to_year,
+                    ):
+                        db.upsert_article(
+                            ArticleRecord(
+                                doi=article.doi,
+                                journal_id=int(journal["id"]),
+                                title=article.title,
+                                year=article.year,
+                                source=article.source,
+                            )
                         )
-                    )
-                    count += 1
-                    source_count += 1
-                print(f"{journal['name']} [{client.__class__.__name__}]: {source_count} DOI")
+                        count += 1
+                        source_count += 1
+                    print(f"{journal['name']} [{client.__class__.__name__}]: {source_count} DOI")
+                except Exception as exc:
+                    message = f"{client.__class__.__name__}: {exc}"
+                    db.mark_journal_status(int(journal["id"]), "error", message)
+                    print(f"{journal['name']} [{client.__class__.__name__}] failed: {exc}")
             total += count
+            if count:
+                db.mark_journal_status(int(journal["id"]), "discovered", f"{count} DOI candidates")
             print(f"{journal['name']}: {count} DOI candidates")
         print(f"Discovered DOI records: {total}")
         return 0

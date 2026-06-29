@@ -46,6 +46,31 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(jobs[0]["doi"], "10.1038/example")
             self.assertEqual(jobs[0]["status"], "pending")
 
+    def test_upsert_article_records_multiple_metadata_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "papers.db")
+            db.init()
+            db.import_journals([("Nature", "")])
+
+            db.upsert_article(ArticleRecord(doi="10.1038/example", journal_id=1, source="openalex"))
+            db.upsert_article(ArticleRecord(doi="10.1038/example", journal_id=1, source="crossref"))
+
+            sources = db.list_article_sources("10.1038/example")
+            self.assertEqual(sources, ["crossref", "openalex"])
+
+    def test_events_and_journal_status_are_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "papers.db")
+            db.init()
+            db.import_journals([("Nature", "")])
+
+            db.mark_journal_status(1, "error", "Crossref HTTP 500")
+            events = db.list_events(limit=5)
+
+            self.assertEqual(db.list_journals()[0]["status"], "error")
+            self.assertEqual(events[0]["kind"], "journal_error")
+            self.assertIn("Crossref HTTP 500", events[0]["message"])
+
     def test_mark_downloaded_records_pdf_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "papers.db")

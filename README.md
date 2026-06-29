@@ -30,6 +30,8 @@ PAPER_COOKIE_DIR=.cookies
 PAPER_MAILTO=your@email.com
 PAPER_LIMIT_PER_JOURNAL=100
 PAPER_DOWNLOAD_LIMIT=50
+PAPER_FROM_YEAR=
+PAPER_TO_YEAR=
 
 PAPER_MIN_DELAY=2.0
 PAPER_MAX_DELAY=5.0
@@ -78,6 +80,13 @@ Discover DOI records from OpenAlex and Crossref:
 python download_papers.py discover
 ```
 
+Optionally limit discovery by publication year in `.env`:
+
+```env
+PAPER_FROM_YEAR=2000
+PAPER_TO_YEAR=2026
+```
+
 Download pending DOI jobs:
 
 ```bash
@@ -119,6 +128,10 @@ The current `name.txt` uses the second form.
   go through the database-backed subcommands.
 - Downloads are resumable: downloaded jobs are marked in SQLite and existing
   PDF files are skipped.
+- DOI discovery is also resilient: if one metadata source fails for a journal,
+  the failure is recorded in SQLite events and the next source/journal continues.
+- OpenAlex and Crossref discoveries are deduplicated by DOI, while the original
+  metadata sources are preserved in `article_sources`.
 - PDF writes remain atomic: files are written as `.part` first and renamed only
   after the `%PDF` signature is verified.
 - For large runs, use small batches such as `download --limit 50` and inspect
