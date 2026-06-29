@@ -76,3 +76,73 @@ class OpenAlexClient:
         if not raw:
             return ""
         return normalize_doi(raw).lower()
+
+
+class CrossrefClient:
+    def __init__(self, mailto: str | None = None, rows: int = 100) -> None:
+        self.mailto = mailto
+        self.rows = rows
+
+    def iter_articles(self, journal_name: str, limit: int | None = None) -> Iterator[DiscoveredArticle]:
+        yielded = 0
+        offset = 0
+        seen: set[str] = set()
+        while True:
+            rows = min(self.rows, limit or self.rows)
+            params = {
+                "query.container-title": journal_name,
+                "filter": "type:journal-article,has-full-text:true",
+                "rows": str(rows),
+                "offset": str(offset),
+            }
+            if self.mailto:
+                params["mailto"] = self.mailto
+            response = urlopen_json("https://api.crossref.org/works?" + urlencode(params))
+            if response.status_code != 200:
+                raise RuntimeError(f"Crossref HTTP {response.status_code}: {response.text[:200]}")
+            items = (response.json().get("message") or {}).get("items") or []
+            if not items:
+                return
+            for item in items:
+                doi = self._clean_doi(item.get("DOI"))
+                if not doi or doi in seen:
+                    continue
+                seen.add(doi)
+                yield DiscoveredArticle(
+                    doi=doi,
+                    title=self._title(item),
+                    year=self._year(item),
+                    source="crossref",
+                )
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    return
+            if len(items) < rows:
+                return
+            offset += len(items)
+
+    @staticmethod
+    def _clean_doi(raw: str | None) -> str:
+        if not raw:
+            return ""
+        return normalize_doi(raw).lower()
+
+    @staticmethod
+    def _title(item: dict) -> str:
+        title = item.get("title")
+        if isinstance(title, list) and title:
+            return str(title[0])
+        if isinstance(title, str):
+            return title
+        return ""
+
+    @staticmethod
+    def _year(item: dict) -> int | None:
+        for key in ("published-print", "published-online", "published", "issued"):
+            date_parts = (item.get(key) or {}).get("date-parts")
+            if date_parts and date_parts[0]:
+                try:
+                    return int(date_parts[0][0])
+                except (TypeError, ValueError):
+                    return None
+        return None

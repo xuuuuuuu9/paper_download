@@ -17,6 +17,28 @@ If you use the checked-in virtual environment, run commands with:
 .\.venv\Scripts\python.exe download_papers.py --help
 ```
 
+## Configure
+
+Copy `.env.example` to `.env`, then edit the values for your local run:
+
+```env
+PAPER_DB=data/papers.db
+PAPER_JOURNAL_FILE=name.txt
+PAPER_OUTPUT_DIR=papers
+PAPER_COOKIE_DIR=.cookies
+
+PAPER_MAILTO=your@email.com
+PAPER_LIMIT_PER_JOURNAL=100
+PAPER_DOWNLOAD_LIMIT=50
+
+PAPER_MIN_DELAY=2.0
+PAPER_MAX_DELAY=5.0
+PAPER_NO_INTERACTIVE=false
+PAPER_MIRRORS=sci-hub.ru,sci-hub.st,sci-hub.su,sci-hub.box
+```
+
+CLI flags override `.env`, and `.env` overrides built-in defaults.
+
 ## Data Model
 
 SQLite stores journals, discovered articles, download jobs, PDF file metadata,
@@ -50,16 +72,16 @@ Import journals from `name.txt`:
 python download_papers.py import-journals -i name.txt
 ```
 
-Discover DOI records from OpenAlex:
+Discover DOI records from OpenAlex and Crossref:
 
 ```bash
-python download_papers.py discover --limit-per-journal 100 --mailto your@email.com
+python download_papers.py discover
 ```
 
 Download pending DOI jobs:
 
 ```bash
-python download_papers.py download --limit 50
+python download_papers.py download
 ```
 
 Show queue status:

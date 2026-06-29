@@ -6,3 +6,6 @@ curl_cffi>=0.7.0
 # solved once, then stores cookies for later runs.
 # After install run: playwright install chromium
 playwright>=1.40.0
+
+# Standard .env loading for repeatable CLI runs.
+python-dotenv>=1.2.0
